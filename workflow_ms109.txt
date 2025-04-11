@@ -1,0 +1,1312 @@
+###MS_109
+###Merge R1-R2, then merge (concatenate) by primer
+
+
+setwd("/Volumes/millera25lab/projects/MS_109_CWRU_ProstateMicrobiome/MiSeq-Microbiome_Project-2022")
+args = commandArgs(trailingOnly=TRUE)
+options(error=expression(NULL))
+library(dada2)
+##Put path to directory of reads in variable
+##Separate forward and reverse reads - change this for already paired reads
+fnFs <- sort(list.files(pattern="_R1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(pattern="_R2.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- basename(fnFs)
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path("filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path("filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(150),
+              maxN=0, maxEE=c(10), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, multithread=TRUE) # On Windows set multithread=FALSE
+write.table(out, "initial_highquality_reads.txt", sep="\t")
+##Learn error rates              
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+##Sample inference
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+##Make count table
+seqtab <- makeSequenceTable(dadaFs)
+##Remove Chimeras
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+##Assign taxonomy
+taxa <- assignTaxonomy(seqtab.nochim, "/Volumes/millera25lab/projects/public_data/new_refseqs_asv_bacteria.fna", multithread=TRUE)
+library(phyloseq)
+library(Biostrings)
+library(ggplot2)
+library(microbiome)
+library(metagMisc)
+library(plyr)
+library(DECIPHER)
+samples.out <- rownames(seqtab.nochim)
+pst <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE),
+               tax_table(taxa))
+pst <- subset_taxa(pst, (Class!="Chloroplast") | is.na(Class))
+pst <- subset_taxa(pst, (Order!="Rickettsiales") | is.na(Order))
+pst <- subset_taxa(pst, (Kingdom!="Eukaryota") | is.na(Kingdom))
+pst <- subset_taxa(pst, !(Phylum %in% c(NA)))
+write.table(otu_table(pst), "otu_table_seqs.txt", sep="\t")
+write.table(tax_table(pst), "tax_table_seqs.txt", sep="\t")
+dna <- Biostrings::DNAStringSet(taxa_names(pst))
+names(dna) <- taxa_names(pst)
+otu.file <- read.csv("otu_table_seqs_nohost.txt", header = TRUE, sep="\t", stringsAsFactors=FALSE, row.names=1, check.names=FALSE)
+tax.file <- as.matrix(read.csv("tax_table_seqs_nohost.txt", header = TRUE, sep="\t", row.names=1))
+ps = phyloseq(otu_table(otu.file, taxa_are_rows=TRUE), tax_table(tax.file))
+ps <- merge_phyloseq(ps, dna)
+##Generate phylogenetic tree
+getSequences(tax_table(ps))
+names(seqs) <- seqs
+alignment <- AlignSeqs(DNAStringSet(seqs), anchor=NA)
+library(msa)
+library(phangorn)
+phang.align <- phyDat(as(alignment, "matrix"), type="DNA")
+dm <- dist.ml(phang.align)
+treeNJ <- NJ(dm) # Note, tip order != sequence order
+fit = pml(treeNJ, data=phang.align)
+
+## negative edges length changed to 0!
+
+fitGTR <- update(fit, k=4, inv=0.2)
+detach("package:phangorn", unload=TRUE)
+ps <- phyloseq(otu_table(ps),  
+               tax_table(ps), phy_tree(fitGTR$tree))
+tree1 = phy_tree(ps)
+
+sampledata <- read.table("map.txt", header=TRUE, check.names=FALSE, sep="\t", row.names=1)
+ps <- phyloseq(otu_table(ps),  
+               tax_table(ps), sample_data(sampledata), phy_tree(fitGTR$tree))
+
+library(decontam)
+df <- as.data.frame(sample_data(ps))
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_type)) + geom_point()
+sample_data(ps)$is.neg <- sample_data(ps)$Sample_type == "Negative"
+contamdf.prev05 <- isContaminant(ps, method="prevalence", neg="is.neg", threshold=0.5)
+write.csv(contamdf.prev05, "contaminants_prev_ps.csv")  ##Open the file to see which specific ASVs are considered contaminants
+ps_decontam <- prune_taxa(!contamdf.prev05$contaminant, ps)
+
+samp_type <- c("Sample")
+ps_nocont = subset_samples(ps_decontam, (Sample_type %in% samp_type))
+
+
+
+###Read count by step
+rads <- read.table("reads.txt", header=TRUE, sep="\t")
+rads$Step <- factor(rads$Step, levels=c("Raw_count", "High_quality", "No_host", "Decontam"))
+f1 <- rads$Step
+f2 <- rads$Sample_type
+f3 <- paste(f1,f2)
+results <- aov(Reads ~ f1 + f2 + f3, data=rads)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Step) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+rp[3] = substitute(expression(italic(Sample_type) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[2], digits = 3)))[2]
+rp[4] = substitute(expression(italic(Interaction) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[3], digits = 3)))[2]
+lab_y <- mean(rads$Reads * 2)
+ggplot(rads, aes(y = Reads, x = Step, color = Sample_type)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Quality step") + labs(color="Sample type") +ylab("No. of reads") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/reads_by_step.pdf", type="pdf")
+
+samp_type <- c("V1-V2")
+ps_v1v2 = subset_samples(ps, (primer %in% samp_type))
+samp_type <- c("V3-V5")
+ps_v3v5 = subset_samples(ps, (primer %in% samp_type))
+samp_type <- c("V6-V9")
+ps_v6v9 = subset_samples(ps, (primer %in% samp_type))
+
+
+
+pd_alpha <-  phyloseq_phylo_div(ps_v1v2, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps_v1v2))
+f1 <- bind$Sample_type
+results <- aov(PD ~ f1, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Sample_type) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2)
+ggplot(bind, aes(y = PD, x = Sample_type, color = Sample_type)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Tissue") + labs(color="Sample type") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_sample_type_ps_v1v2.pdf", type="pdf")
+
+
+ps_log2 <- transform_sample_counts(ps_v1v2,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="wunifrac")))
+f1 <- sample_data(ps_log2)$Sample_type
+pm <- adonis2(ps.dist ~ f1, permutations = 999)
+pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f1)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 4)
+rp[1] = substitute(paste(italic(global_p)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Sample_type) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Seqtype", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomleft", legend=levels(as.factor(sample_data(ps_log2)$Sample_type)), col=1:15, pch=1:15, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_v1v2_log2_sample_type.pdf", type="pdf")
+
+pd_alpha <-  phyloseq_phylo_div(ps_v3v5, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps_v3v5))
+f1 <- bind$Sample_type
+results <- aov(PD ~ f1, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Sample_type) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2)
+ggplot(bind, aes(y = PD, x = Sample_type, color = Sample_type)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Tissue") + labs(color="Sample type") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_v3v5_sample_type.pdf", type="pdf")
+
+
+ps_log2 <- transform_sample_counts(ps_v3v5,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="wunifrac")))
+f1 <- sample_data(ps_log2)$Sample_type
+pm <- adonis2(ps.dist ~ f1, permutations = 999)
+pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f1)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 4)
+rp[1] = substitute(paste(italic(global_p)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Sample_type) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Seqtype", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomleft", legend=levels(as.factor(sample_data(ps_log2)$Sample_type)), col=1:15, pch=1:15, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_v3v5_log2_sample_type.pdf", type="pdf")
+
+pd_alpha <-  phyloseq_phylo_div(ps_v6v9, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps_v6v9))
+f1 <- bind$Sample_type
+results <- aov(PD ~ f1, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Sample_type) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2)
+ggplot(bind, aes(y = PD, x = Sample_type, color = Sample_type)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Tissue") + labs(color="Sample type") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_v6v9_sample_type.pdf", type="pdf")
+
+
+ps_log2 <- transform_sample_counts(ps_v6v9,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="wunifrac")))
+f1 <- sample_data(ps_log2)$Sample_type
+pm <- adonis2(ps.dist ~ f1, permutations = 999)
+pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f1)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 4)
+rp[1] = substitute(paste(italic(global_p)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Sample_type) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Seqtype", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomleft", legend=levels(as.factor(sample_data(ps_log2)$Sample_type)), col=1:15, pch=1:15, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_v6v9_log2_sample_type.pdf", type="pdf")
+
+
+
+ps_v1v2
+ps_v3v5
+ps_v6v9
+
+
+#########Genus level
+library(dplyr)
+library(Polychrome)
+ps.rel = transform_sample_counts(ps, function(x) x/sum(x)*100)
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Genus <- as.character(ps.melt$Genus)
+
+
+ps.melt <- ps.melt %>%
+  group_by(Sample_type, Genus) %>%
+  mutate(median=median(Abundance))
+# select tissue mean > 1
+keep <- unique(ps.melt$Genus[ps.melt$Abundance > 1])
+ps.melt$Genus[!(ps.melt$Genus %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Genus))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,Sample_type,Genus) %>%
+  summarise(Abundance=sum(Abundance))
+
+ggplot(ps.melt, aes(x = Sample_type, y = Abundance, fill = Genus, color = Genus)) + 
+  geom_bar(stat = "identity", aes(fill=Genus), position="fill") + 
+  labs(x="Sample_type", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5))))
+quartz.save("results/genus_profile_Sample_type.pdf", type="pdf")
+
+
+        
+############Phylum level
+        
+library(Polychrome)
+ps.rel = transform_sample_counts(ps, function(x) x/sum(x)*100)
+# agglomerate taxa
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Phylum <- as.character(ps.melt$Phylum)
+
+
+ps.melt <- ps.melt %>%
+  group_by(Sample_type, Phylum) %>%
+  mutate(median=median(Abundance))
+# select Sample_type mean > 1
+keep <- unique(ps.melt$Phylum[ps.melt$Abundance > 1])
+ps.melt$Phylum[!(ps.melt$Phylum %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Phylum))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,Sample_type,Phylum) %>%
+  summarise(Abundance=sum(Abundance))
+
+ggplot(ps.melt, aes(x = Sample_type, y = Abundance, fill = Phylum, color = Phylum)) + 
+  geom_bar(stat = "identity", aes(fill=Phylum), position="fill") + 
+  labs(x="tissue", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5))))
+quartz.save("results/phylum_profile_Sample_type.pdf", type="pdf")   
+
+df <- as.data.frame(t(otu_table(ps_nocont)))
+rarecurve(df, step = 1000, label = FALSE)
+abline(v = 1000, col = c("blue"))  ## change v=## based on where the species richness 
+rslope <- as.data.frame(rareslope(df, 1000))
+mean(rslope[ , c(1)] < 0.01)
+quartz.save(file="rarecurve.pdf", type="pdf")
+
+write.table(otu_table(ps_nocont), "otu_table_seqs_ps_nocont.txt", sep="\t")
+write.table(tax_table(ps_nocont), "tax_table_seqs_ps_nocont.txt", sep="\t")
+ps = prune_samples(sample_sums(ps_nocont)>=1000, ps_nocont)
+
+pd_alpha <-  phyloseq_phylo_div(ps, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps))
+f1 <- bind$primer
+results <- aov(PD ~ f1, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Primer) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2)
+ggplot(bind, aes(y = PD, x = primer, color = primer)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Primer") + labs(color="Primer") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_Primer.pdf", type="pdf")
+
+
+ps_log2 <- transform_sample_counts(ps,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="wunifrac")))
+f1 <- sample_data(ps_log2)$primer
+pm <- adonis2(ps.dist ~ f1, permutations = 999)
+pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f1)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 4)
+rp[1] = substitute(paste(italic(global_p)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(primer) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Seqtype", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomleft", legend=levels(as.factor(sample_data(ps_log2)$Sample_type)), col=1:15, pch=1:15, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_log2_primer.pdf", type="pdf")
+
+ps_v1v2
+ps_v3v5
+ps_v6v9
+
+#########Genus level
+library(dplyr)
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v1v2, function(x) x/sum(x)*100)
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Genus <- as.character(ps.melt$Genus)
+
+
+ps.melt <- ps.melt %>%
+  group_by(Sample_type, Genus) %>%
+  mutate(median=median(Abundance))
+# select tissue mean > 1
+keep <- unique(ps.melt$Genus[ps.melt$Abundance > 1])
+ps.melt$Genus[!(ps.melt$Genus %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Genus))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,Sample_type,Genus) %>%
+  summarise(Abundance=sum(Abundance))
+
+pdf(file=sprintf("results/genus_profile_Sample_type_ps_v1v2.pdf"), width=20)
+ggplot(ps.melt, aes(x = Sample_type, y = Abundance, fill = Genus, color = Genus)) + 
+  geom_bar(stat = "identity", aes(fill=Genus), position="fill") + 
+  labs(x="Sample_type", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5))))
+dev.off()
+
+
+        
+############Phylum level
+        
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v1v2, function(x) x/sum(x)*100)
+# agglomerate taxa
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Phylum <- as.character(ps.melt$Phylum)
+
+
+ps.melt <- ps.melt %>%
+  group_by(Sample_type, Phylum) %>%
+  mutate(median=median(Abundance))
+# select Sample_type mean > 1
+keep <- unique(ps.melt$Phylum[ps.melt$Abundance > 1])
+ps.melt$Phylum[!(ps.melt$Phylum %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Phylum))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,Sample_type,Phylum) %>%
+  summarise(Abundance=sum(Abundance))
+
+pdf(file=sprintf("results/phylum_profile_Sample_type_ps_v1v2.pdf"), width=10)
+ggplot(ps.melt, aes(x = Sample_type, y = Abundance, fill = Phylum, color = Phylum)) + 
+  geom_bar(stat = "identity", aes(fill=Phylum), position="fill") + 
+  labs(x="tissue", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5))))
+dev.off()  
+
+#########Genus level
+library(dplyr)
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v3v5, function(x) x/sum(x)*100)
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Genus <- as.character(ps.melt$Genus)
+
+
+ps.melt <- ps.melt %>%
+  group_by(Sample_type, Genus) %>%
+  mutate(median=median(Abundance))
+# select tissue mean > 1
+keep <- unique(ps.melt$Genus[ps.melt$Abundance > 1])
+ps.melt$Genus[!(ps.melt$Genus %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Genus))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,Sample_type,Genus) %>%
+  summarise(Abundance=sum(Abundance))
+
+pdf(file=sprintf("results/genus_profile_Sample_type_ps_v3v5.pdf"), width=35)
+ggplot(ps.melt, aes(x = Sample_type, y = Abundance, fill = Genus, color = Genus)) + 
+  geom_bar(stat = "identity", aes(fill=Genus), position="fill") + 
+  labs(x="Sample_type", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5))))
+dev.off()
+
+
+        
+############Phylum level
+        
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v3v5, function(x) x/sum(x)*100)
+# agglomerate taxa
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Phylum <- as.character(ps.melt$Phylum)
+
+
+ps.melt <- ps.melt %>%
+  group_by(Sample_type, Phylum) %>%
+  mutate(median=median(Abundance))
+# select Sample_type mean > 1
+keep <- unique(ps.melt$Phylum[ps.melt$Abundance > 1])
+ps.melt$Phylum[!(ps.melt$Phylum %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Phylum))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,Sample_type,Phylum) %>%
+  summarise(Abundance=sum(Abundance))
+
+pdf(file=sprintf("results/phylum_profile_Sample_type_ps_v3v5.pdf"), width=10)
+ggplot(ps.melt, aes(x = Sample_type, y = Abundance, fill = Phylum, color = Phylum)) + 
+  geom_bar(stat = "identity", aes(fill=Phylum), position="fill") + 
+  labs(x="tissue", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5))))
+dev.off()  
+
+#########Genus level
+library(dplyr)
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v6v9, function(x) x/sum(x)*100)
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Genus <- as.character(ps.melt$Genus)
+
+
+ps.melt <- ps.melt %>%
+  group_by(Sample_type, Genus) %>%
+  mutate(median=median(Abundance))
+# select tissue mean > 1
+keep <- unique(ps.melt$Genus[ps.melt$Abundance > 1])
+ps.melt$Genus[!(ps.melt$Genus %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Genus))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,Sample_type,Genus) %>%
+  summarise(Abundance=sum(Abundance))
+
+pdf(file=sprintf("results/genus_profile_Sample_type_ps_v6v9.pdf"), width=30)
+ggplot(ps.melt, aes(x = Sample_type, y = Abundance, fill = Genus, color = Genus)) + 
+  geom_bar(stat = "identity", aes(fill=Genus), position="fill") + 
+  labs(x="Sample_type", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5))))
+dev.off()
+
+
+        
+############Phylum level
+        
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v6v9, function(x) x/sum(x)*100)
+# agglomerate taxa
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Phylum <- as.character(ps.melt$Phylum)
+
+
+ps.melt <- ps.melt %>%
+  group_by(Sample_type, Phylum) %>%
+  mutate(median=median(Abundance))
+# select Sample_type mean > 1
+keep <- unique(ps.melt$Phylum[ps.melt$Abundance > 1])
+ps.melt$Phylum[!(ps.melt$Phylum %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Phylum))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample,Sample_type,Phylum) %>%
+  summarise(Abundance=sum(Abundance))
+
+pdf(file=sprintf("results/phylum_profile_Sample_type_ps_v6v9.pdf"), width=10)
+ggplot(ps.melt, aes(x = Sample_type, y = Abundance, fill = Phylum, color = Phylum)) + 
+  geom_bar(stat = "identity", aes(fill=Phylum), position="fill") + 
+  labs(x="tissue", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5))))
+dev.off()  
+
+ps_v1v2
+ps_v3v5
+ps_v6v9
+
+library(decontam)
+df <- as.data.frame(sample_data(ps_v1v2))
+df$LibrarySize <- sample_sums(ps_v1v2)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_type)) + geom_point()
+sample_data(ps_v1v2)$is.neg <- sample_data(ps_v1v2)$Sample_type == "Negative"
+contamdf.prev05 <- isContaminant(ps_v1v2, method="prevalence", neg="is.neg", threshold=0.5)
+write.csv(contamdf.prev05, "contaminants_prev_ps_v1v2.csv")  ##Open the file to see which specific ASVs are considered contaminants
+ps_v1v2_decontam <- prune_taxa(!contamdf.prev05$contaminant, ps_v1v2)
+
+samp_type <- c("Sample")
+ps_v1v2_nocont = subset_samples(ps_v1v2_decontam, (Sample_type %in% samp_type))
+
+df <- as.data.frame(sample_data(ps_v3v5))
+df$LibrarySize <- sample_sums(ps_v3v5)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_type)) + geom_point()
+sample_data(ps_v3v5)$is.neg <- sample_data(ps_v3v5)$Sample_type == "Negative"
+contamdf.prev05 <- isContaminant(ps_v3v5, method="prevalence", neg="is.neg", threshold=0.5)
+write.csv(contamdf.prev05, "contaminants_prev_ps_v3v5.csv")  ##Open the file to see which specific ASVs are considered contaminants
+ps_v3v5_decontam <- prune_taxa(!contamdf.prev05$contaminant, ps_v3v5)
+
+samp_type <- c("Sample")
+ps_v3v5_nocont = subset_samples(ps_v3v5_decontam, (Sample_type %in% samp_type))
+
+df <- as.data.frame(sample_data(ps_v6v9))
+df$LibrarySize <- sample_sums(ps_v6v9)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=Sample_type)) + geom_point()
+sample_data(ps_v6v9)$is.neg <- sample_data(ps_v6v9)$Sample_type == "Negative"
+contamdf.prev05 <- isContaminant(ps_v6v9, method="prevalence", neg="is.neg", threshold=0.5)
+write.csv(contamdf.prev05, "contaminants_prev_ps_v6v9.csv")  ##Open the file to see which specific ASVs are considered contaminants
+ps_v6v9_decontam <- prune_taxa(!contamdf.prev05$contaminant, ps_v6v9)
+
+samp_type <- c("Sample")
+ps_v6v9_nocont = subset_samples(ps_v6v9_decontam, (Sample_type %in% samp_type))
+
+df <- as.data.frame(t(otu_table(ps_v1v2_nocont)))
+pdf(file=sprintf("results/rarecurve_ps_v1v2_nocont.pdf"), width=10)
+rarecurve(df, step = 1000, label = FALSE)
+abline(v = 1000, col = c("blue"))  ## change v=## based on where the species richness 
+dev.off()
+rslope <- as.data.frame(rareslope(df, 1000))
+mean(rslope[ , c(1)] < 0.01)
+ps_v1v2 = prune_samples(sample_sums(ps_v1v2_nocont)>=100, ps_v1v2_nocont)
+
+df <- as.data.frame(t(otu_table(ps_v3v5_nocont)))
+pdf(file=sprintf("results/rarecurve_ps_v3v5_nocont.pdf"), width=10)
+rarecurve(df, step = 1000, label = FALSE)
+abline(v = 1000, col = c("blue"))  ## change v=## based on where the species richness 
+dev.off()
+abline(v = 1000, col = c("blue"))  ## change v=## based on where the species richness 
+rslope <- as.data.frame(rareslope(df, 100))
+mean(rslope[ , c(1)] < 0.01)
+ps_v3v5 = prune_samples(sample_sums(ps_v3v5_nocont)>=100, ps_v3v5_nocont)
+
+df <- as.data.frame(t(otu_table(ps_v6v9_nocont)))
+pdf(file=sprintf("results/rarecurve_ps_v6v9_nocont.pdf"), width=10)
+rarecurve(df, step = 1000, label = FALSE)
+abline(v = 1000, col = c("blue"))  ## change v=## based on where the species richness 
+dev.off()
+abline(v = 1000, col = c("blue"))  ## change v=## based on where the species richness 
+rslope <- as.data.frame(rareslope(df, 100))
+mean(rslope[ , c(1)] < 0.01)
+ps_v6v9 = prune_samples(sample_sums(ps_v6v9_nocont)>=100, ps_v6v9_nocont)
+
+
+ps_v1v2
+ps_v3v5
+ps_v6v9
+
+
+
+###Alpha - ethnicity
+pd_alpha <- phyloseq_phylo_div(ps_v1v2, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps_v1v2))
+f1 <- bind$Ethnicity
+results <- aov(PD ~ f1, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2)
+ggplot(bind, aes(y = PD, x = Ethnicity, color = Ethnicity)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Ethnicity") + labs(color="Ethnicity") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_v1v2_Ethnicity.pdf", type="pdf")
+
+pd_alpha <- phyloseq_phylo_div(ps_v3v5, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps_v3v5))
+f1 <- bind$Ethnicity
+results <- aov(PD ~ f1, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2)
+ggplot(bind, aes(y = PD, x = Ethnicity, color = Ethnicity)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Ethnicity") + labs(color="Ethnicity") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_v3v5_Ethnicity.pdf", type="pdf")
+
+pd_alpha <- phyloseq_phylo_div(ps_v6v9, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps_v6v9))
+f1 <- bind$Ethnicity
+results <- aov(PD ~ f1, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2)
+ggplot(bind, aes(y = PD, x = Ethnicity, color = Ethnicity)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Ethnicity") + labs(color="Ethnicity") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_v6v9_Ethnicity.pdf", type="pdf")
+
+pd_alpha <- phyloseq_phylo_div(ps_v1v2, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps_v1v2))
+f1 <- bind$Ethnicity
+f2 <- bind$Pathology
+f3 <- paste(f1,f2)
+results <- aov(PD ~ f1 + f2 + f3, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+rp[3] = substitute(expression(italic(Pathology) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[2], digits = 3)))[2]
+rp[4] = substitute(expression(italic(Interaction) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[3], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2.6)
+ggplot(bind, aes(y = PD, x = Ethnicity, color = Pathology)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Ethnicity") + labs(color="Pathology") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_v1v2_Ethnicity_pathology.pdf", type="pdf")
+
+pd_alpha <- phyloseq_phylo_div(ps_v3v5, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps_v3v5))
+f1 <- bind$Ethnicity
+f2 <- bind$Pathology
+f3 <- paste(f1,f2)
+results <- aov(PD ~ f1 + f2 + f3, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+rp[3] = substitute(expression(italic(Pathology) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[2], digits = 3)))[2]
+rp[4] = substitute(expression(italic(Interaction) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[3], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2.8)
+ggplot(bind, aes(y = PD, x = Ethnicity, color = Pathology)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Ethnicity") + labs(color="Pathology") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_v3v5_Ethnicity_pathology.pdf", type="pdf")
+
+
+pd_alpha <- phyloseq_phylo_div(ps_v6v9, measures = c("PD"))
+bind <- cbind(pd_alpha, sample_data(ps_v6v9))
+f1 <- bind$Ethnicity
+f2 <- bind$Pathology
+f3 <- paste(f1,f2)
+results <- aov(PD ~ f1 + f2 + f3, data=bind)
+summary(results)
+pval <- summary(results)[[1]][["Pr(>F)"]]
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+rp[3] = substitute(expression(italic(Pathology) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[2], digits = 3)))[2]
+rp[4] = substitute(expression(italic(Interaction) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[3], digits = 3)))[2]
+lab_y <- mean(bind$PD * 2.6)
+ggplot(bind, aes(y = PD, x = Ethnicity, color = Pathology)) + geom_boxplot(outlier.shape = NA, size=1.5) + geom_point(position = position_jitterdodge(jitter.width = 0.1), size=3) + xlab("Ethnicity") + labs(color="Pathology") +ylab("Phylogenetic diversity") + annotate("text", x = 1.5, y = lab_y, label = rp[1], size=7) + annotate("text", x = 1.5, y = lab_y*0.95, label = rp[2], size=7) + annotate("text", x = 1.5, y = lab_y*0.9, label = rp[3], size=7) + annotate("text", x = 1.5, y = lab_y*0.85, label = rp[4], size=7) + ggtitle("Species richness by Health and Sample type" ) + theme_classic() + theme(text = element_text(size=25, color="black")) + theme(plot.title = element_text(hjust = 0.5)) ###2-way analysis, change color to second variable, also change labs() to variable 2
+quartz.save("results/alpha_ps_v6v9_Ethnicity_pathology.pdf", type="pdf")
+
+
+###Beta - ethnicity
+ps_log2 <- transform_sample_counts(ps_v1v2,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="wunifrac")))
+f1 <- sample_data(ps_log2)$Ethnicity
+pm <- adonis2(ps.dist ~ f1, permutations = 999)
+pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f1)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 4)
+rp[1] = substitute(paste(italic(global_p)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Seqtype", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomleft", legend=levels(as.factor(sample_data(ps_log2)$Ethnicity)), col=1:15, pch=1:15, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_v1v2_Ethnicity.pdf", type="pdf")
+
+ps_log2 <- transform_sample_counts(ps_v6v9,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="wunifrac")))
+f1 <- sample_data(ps_log2)$Ethnicity
+pm <- adonis2(ps.dist ~ f1, permutations = 999)
+pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f1)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 4)
+rp[1] = substitute(paste(italic(global_p)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Seqtype", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomleft", legend=levels(as.factor(sample_data(ps_log2)$Ethnicity)), col=1:15, pch=1:15, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_v6v9_Ethnicity.pdf", type="pdf")
+
+ps_log2 <- transform_sample_counts(ps_v3v5,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="wunifrac")))
+f1 <- sample_data(ps_log2)$Ethnicity
+pm <- adonis2(ps.dist ~ f1, permutations = 999)
+pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f1)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 4)
+rp[1] = substitute(paste(italic(global_p)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Seqtype", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomleft", legend=levels(as.factor(sample_data(ps_log2)$Ethnicity)), col=1:15, pch=1:15, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_v3v5_Ethnicity.pdf", type="pdf")
+
+ps_log2 <- transform_sample_counts(ps_v1v2,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+f1 <- sample_data(ps_log2)$Ethnicity
+f2 <- sample_data(ps_log2)$Pathology
+f3 <- paste(f1,f2)
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="bray")))
+pm <- adonis2(ps.dist ~ f1 + f2 + f3, permutations = 999)
+pval <- pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f3)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+rp[3] = substitute(expression(italic(Pathology) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[2], digits = 3)))[2]
+rp[4] = substitute(expression(italic(Interaction) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[3], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Health and Sample type", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomright", legend=levels(as.factor(f3)), col=1:8, pch=1:8, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_v1v2_ethnicity_pathology.pdf", type="pdf")
+pm2 <- pairwise.adonis(ps.dist, f3)
+
+ps_log2 <- transform_sample_counts(ps_v3v5,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+f1 <- sample_data(ps_log2)$Ethnicity
+f2 <- sample_data(ps_log2)$Pathology
+f3 <- paste(f1,f2)
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="bray")))
+pm <- adonis2(ps.dist ~ f1 + f2 + f3, permutations = 999)
+pval <- pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f3)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+rp[3] = substitute(expression(italic(Pathology) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[2], digits = 3)))[2]
+rp[4] = substitute(expression(italic(Interaction) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[3], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Health and Sample type", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomright", legend=levels(as.factor(f3)), col=1:8, pch=1:8, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_v3v5_ethnicity_pathology.pdf", type="pdf")
+pm2 <- pairwise.adonis(ps.dist, f3)
+
+ps_log2 <- transform_sample_counts(ps_v6v9,log2)
+otu_table(ps_log2)[otu_table(ps_log2) < 0.0] <- 0.0
+f1 <- sample_data(ps_log2)$Ethnicity
+f2 <- sample_data(ps_log2)$Pathology
+f3 <- paste(f1,f2)
+ps.dist <- as.data.frame(as.matrix(phyloseq::distance(ps_log2, method="bray")))
+pm <- adonis2(ps.dist ~ f1 + f2 + f3, permutations = 999)
+pval <- pval <- pm[[5]]
+pd <- betadisper(as.dist(ps.dist), f3)
+eigen <- eigenvals(pd)
+pcoa1 <- capture.output(cat("PCoA1 (", scales::percent(eigen["PCoA1"]/sum(eigen), accuracy=0.01), "of variance )"))
+pcoa2 <- capture.output(cat("PCoA2 (", scales::percent(eigen["PCoA2"]/sum(eigen), accuracy=0.01), "of variance )"))
+rp = vector('expression', 3)
+rp[1] = substitute(paste(italic(pvalues)), list(MYOTHERVALUE = format(pval[1])))[2]
+rp[2] = substitute(expression(italic(Ethnicity) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[1], digits = 3)))[2]
+rp[3] = substitute(expression(italic(Pathology) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[2], digits = 3)))[2]
+rp[4] = substitute(expression(italic(Interaction) == MYOTHERVALUE), list(MYOTHERVALUE = format(pval[3], digits = 3)))[2]
+plot(pd, label=FALSE, ellipse=TRUE, hull=FALSE, seg.lty="dashed", cex=0.5, main="Beta x Health and Sample type", cex.main=1.5, cex.sub=0.01, cex.lab=1.5, xlab=pcoa1, ylab=pcoa2, axes=c(1,2))
+legend(x="bottomright", legend=levels(as.factor(f3)), col=1:8, pch=1:8, bty='n')
+legend('topright', legend=rp, bty='n')
+quartz.save("results/beta_ps_v6v9_ethnicity_pathology.pdf", type="pdf")
+pm2 <- pairwise.adonis(ps.dist, f3)
+
+
+ps_v1v2
+ps_v3v5
+ps_v6v9
+
+samp_type <- c("Caucasian")
+ps_v1v2_caucas = subset_samples(ps_v1v2, (Ethnicity %in% samp_type))
+ps_v1v2_aa = subset_samples(ps_v1v2, !(Ethnicity %in% samp_type))
+ps_v3v5_caucas = subset_samples(ps_v3v5, (Ethnicity %in% samp_type))
+ps_v3v5_aa = subset_samples(ps_v3v5, !(Ethnicity %in% samp_type))
+ps_v6v9_caucas = subset_samples(ps_v6v9, (Ethnicity %in% samp_type))
+ps_v6v9_aa = subset_samples(ps_v6v9, !(Ethnicity %in% samp_type))
+samp_type <- c("benign", "Cancer")
+ps_v1v2_caucas_BC = subset_samples(ps_v1v2_caucas, (Pathology %in% samp_type))
+ps_v1v2_aa_BC = subset_samples(ps_v1v2_aa, (Pathology %in% samp_type))
+ps_v6v9_caucas_BC = subset_samples(ps_v6v9_caucas, (Pathology %in% samp_type))
+ps_v3v5_aa_BC = subset_samples(ps_v3v5_aa, (Pathology %in% samp_type))
+ps_v3v5_caucas_BC = subset_samples(ps_v3v5_caucas, (Pathology %in% samp_type))
+ps_v6v9_aa_BC = subset_samples(ps_v6v9_aa, (Pathology %in% samp_type))
+
+samp_type <- c("benign", "inflammation")
+ps_v1v2_caucas_BI = subset_samples(ps_v1v2_caucas, (Pathology %in% samp_type))
+ps_v1v2_aa_BI = subset_samples(ps_v1v2_aa, (Pathology %in% samp_type))
+ps_v6v9_caucas_BI = subset_samples(ps_v6v9_caucas, (Pathology %in% samp_type))
+ps_v3v5_aa_BI = subset_samples(ps_v3v5_aa, (Pathology %in% samp_type))
+ps_v3v5_caucas_BI = subset_samples(ps_v3v5_caucas, (Pathology %in% samp_type))
+ps_v6v9_aa_BI = subset_samples(ps_v6v9_aa, (Pathology %in% samp_type))
+
+
+ps_v1v2_caucas_BC
+ps_v1v2_aa_BC
+ps_v6v9_caucas_BC
+ps_v3v5_aa_BC
+ps_v3v5_caucas_BC
+ps_v6v9_aa_BC
+ps_v1v2_caucas_BI
+ps_v1v2_aa_BI
+ps_v6v9_caucas_BI
+ps_v3v5_aa_BI
+ps_v3v5_caucas_BI
+ps_v6v9_aa_BI
+
+ps_v1v2_caucas_BC <- subset_taxa(ps_v1v2_caucas_BC, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v1v2_caucas_BC)[otu_table(ps_v1v2_caucas_BC) >= 0.0] <- otu_table(ps_v1v2_caucas_BC) + 1
+diagdds = phyloseq_to_deseq2(ps_v1v2_caucas_BC, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v1v2_caucas_BC)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v1v2_caucas_BC.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v1v2_caucas_BC.pdf", type="pdf")
+
+ps_v3v5_caucas_BC <- subset_taxa(ps_v3v5_caucas_BC, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v3v5_caucas_BC)[otu_table(ps_v3v5_caucas_BC) >= 0.0] <- otu_table(ps_v3v5_caucas_BC) + 1
+diagdds = phyloseq_to_deseq2(ps_v3v5_caucas_BC, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v3v5_caucas_BC)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v3v5_caucas_BC.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v3v5_caucas_BC.pdf", type="pdf")
+
+
+ps_v6v9_caucas_BC <- subset_taxa(ps_v6v9_caucas_BC, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v6v9_caucas_BC)[otu_table(ps_v6v9_caucas_BC) >= 0.0] <- otu_table(ps_v6v9_caucas_BC) + 1
+diagdds = phyloseq_to_deseq2(ps_v6v9_caucas_BC, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v6v9_caucas_BC)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v6v9_caucas_BC.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v6v9_caucas_BC.pdf", type="pdf")
+
+ps_v1v2_aa_BC <- subset_taxa(ps_v1v2_aa_BC, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v1v2_aa_BC)[otu_table(ps_v1v2_aa_BC) >= 0.0] <- otu_table(ps_v1v2_aa_BC) + 1
+diagdds = phyloseq_to_deseq2(ps_v1v2_aa_BC, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v1v2_aa_BC)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v1v2_aa_BC.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v1v2_aa_BC.pdf", type="pdf")
+
+ps_v3v5_aa_BC <- subset_taxa(ps_v3v5_aa_BC, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v3v5_aa_BC)[otu_table(ps_v3v5_aa_BC) >= 0.0] <- otu_table(ps_v3v5_aa_BC) + 1
+diagdds = phyloseq_to_deseq2(ps_v3v5_aa_BC, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v3v5_aa_BC)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v3v5_aa_BC.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v3v5_aa_BC.pdf", type="pdf")
+
+
+ps_v6v9_aa_BC <- subset_taxa(ps_v6v9_aa_BC, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v6v9_aa_BC)[otu_table(ps_v6v9_aa_BC) >= 0.0] <- otu_table(ps_v6v9_aa_BC) + 1
+diagdds = phyloseq_to_deseq2(ps_v6v9_aa_BC, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v6v9_aa_BC)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v6v9_aa_BC.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v6v9_aa_BC.pdf", type="pdf")
+
+
+
+
+
+ps_v1v2_caucas_BI <- subset_taxa(ps_v1v2_caucas_BI, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v1v2_caucas_BI)[otu_table(ps_v1v2_caucas_BI) >= 0.0] <- otu_table(ps_v1v2_caucas_BI) + 1
+diagdds = phyloseq_to_deseq2(ps_v1v2_caucas_BI, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v1v2_caucas_BI)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v1v2_caucas_BI.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v1v2_caucas_BI.pdf", type="pdf")
+
+ps_v3v5_caucas_BI <- subset_taxa(ps_v3v5_caucas_BI, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v3v5_caucas_BI)[otu_table(ps_v3v5_caucas_BI) >= 0.0] <- otu_table(ps_v3v5_caucas_BI) + 1
+diagdds = phyloseq_to_deseq2(ps_v3v5_caucas_BI, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v3v5_caucas_BI)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v3v5_caucas_BI.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v3v5_caucas_BI.pdf", type="pdf")
+
+
+ps_v6v9_caucas_BI <- subset_taxa(ps_v6v9_caucas_BI, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v6v9_caucas_BI)[otu_table(ps_v6v9_caucas_BI) >= 0.0] <- otu_table(ps_v6v9_caucas_BI) + 1
+diagdds = phyloseq_to_deseq2(ps_v6v9_caucas_BI, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v6v9_caucas_BI)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v6v9_caucas_BI.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v6v9_caucas_BI.pdf", type="pdf")
+
+ps_v1v2_aa_BI <- subset_taxa(ps_v1v2_aa_BI, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v1v2_aa_BI)[otu_table(ps_v1v2_aa_BI) >= 0.0] <- otu_table(ps_v1v2_aa_BI) + 1
+diagdds = phyloseq_to_deseq2(ps_v1v2_aa_BI, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v1v2_aa_BI)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v1v2_aa_BI.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v1v2_aa_BI.pdf", type="pdf")
+
+ps_v3v5_aa_BI <- subset_taxa(ps_v3v5_aa_BI, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v3v5_aa_BI)[otu_table(ps_v3v5_aa_BI) >= 0.0] <- otu_table(ps_v3v5_aa_BI) + 1
+diagdds = phyloseq_to_deseq2(ps_v3v5_aa_BI, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v3v5_aa_BI)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v3v5_aa_BI.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v3v5_aa_BI.pdf", type="pdf")
+
+
+ps_v6v9_aa_BI <- subset_taxa(ps_v6v9_aa_BI, (Phylum!="Chloroplast") | is.na(Phylum))
+otu_table(ps_v6v9_aa_BI)[otu_table(ps_v6v9_aa_BI) >= 0.0] <- otu_table(ps_v6v9_aa_BI) + 1
+diagdds = phyloseq_to_deseq2(ps_v6v9_aa_BI, ~ Pathology)
+dds_res <- DESeq(diagdds)
+results_dds <- results(dds_res)
+results_dds
+alpha = 0.05
+sigtab = results_dds[which(results_dds$padj < alpha), ]
+sigtab = cbind(as(sigtab, "data.frame"), as(tax_table(ps_v6v9_aa_BI)[rownames(sigtab), ], "matrix"))
+write.table(sigtab, "diff_abun_ps_v6v9_aa_BI.txt", sep="\t")
+
+
+x = tapply(sigtab$log2FoldChange, sigtab$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Phylum = factor(as.character(sigtab$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab$log2FoldChange, sigtab$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab$Genus = factor(as.character(sigtab$Genus), levels=names(x))
+ggplot(sigtab, aes(x=Genus, y=log2FoldChange, color=Phylum)) +
+  theme_classic()+ geom_point(size=6) + 
+  theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5)) + theme(legend.text=element_text(size=18)) + theme(text = element_text(size = 20)) +
+  scale_color_manual(values = fixed_palette)
+quartz.save("results/diff_abun_ps_v6v9_aa_BI.pdf", type="pdf")
+
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v6v9_nocont, function(x) x/sum(x)*100)
+# agglomerate taxa
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Phylum <- as.character(ps.melt$Phylum)
+ps.melt <- ps.melt %>%
+  group_by(Pathology, Phylum) %>%
+  mutate(median=median(Abundance))
+# select Pathology mean > 1
+keep <- unique(ps.melt$Phylum[ps.melt$Abundance > 1])
+ps.melt$Phylum[!(ps.melt$Phylum %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Phylum))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample, Pathology,Phylum) %>%
+  summarise(Abundance=sum(Abundance))
+pdf(file=sprintf("results/phylum_profile_Sample_type_ps_v6v9.pdf"), width=10)
+ggplot(ps.melt, aes(x = Pathology, y = Abundance, fill = Phylum, color = Phylum)) + 
+  geom_bar(stat = "identity", aes(fill=Phylum), position="fill") + 
+  labs(x="Ethnicity", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5)))) + facet_wrap(~Ethnicity)
+dev.off()
+
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v1v2_nocont, function(x) x/sum(x)*100)
+# agglomerate taxa
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Genus <- as.character(ps.melt$Genus)
+ps.melt <- ps.melt %>%
+  group_by(Pathology, Genus) %>%
+  mutate(median=median(Abundance))
+# select Pathology mean > 1
+keep <- unique(ps.melt$Genus[ps.melt$Abundance > 1])
+ps.melt$Genus[!(ps.melt$Genus %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Genus))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample, Pathology,Genus) %>%
+  summarise(Abundance=sum(Abundance))
+pdf(file=sprintf("results/Genus_profile_Sample_type_ps_v1v2.pdf"), width=25)
+ggplot(ps.melt, aes(x = Pathology, y = Abundance, fill = Genus, color = Genus)) + 
+  geom_bar(stat = "identity", aes(fill=Genus), position="fill") + 
+  labs(x="Ethnicity", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5)))) + facet_wrap(~Ethnicity)
+dev.off()
+
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v3v5_nocont, function(x) x/sum(x)*100)
+# agglomerate taxa
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Genus <- as.character(ps.melt$Genus)
+ps.melt <- ps.melt %>%
+  group_by(Pathology, Genus) %>%
+  mutate(median=median(Abundance))
+# select Pathology mean > 1
+keep <- unique(ps.melt$Genus[ps.melt$Abundance > 1])
+ps.melt$Genus[!(ps.melt$Genus %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Genus))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample, Pathology,Genus) %>%
+  summarise(Abundance=sum(Abundance))
+pdf(file=sprintf("results/Genus_profile_Sample_type_ps_v3v5.pdf"), width=25)
+ggplot(ps.melt, aes(x = Pathology, y = Abundance, fill = Genus, color = Genus)) + 
+  geom_bar(stat = "identity", aes(fill=Genus), position="fill") + 
+  labs(x="Ethnicity", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5)))) + facet_wrap(~Ethnicity)
+dev.off()
+
+library(Polychrome)
+ps.rel = transform_sample_counts(ps_v6v9_nocont, function(x) x/sum(x)*100)
+# agglomerate taxa
+ps.melt <- psmelt(ps.rel)
+# change to character for easy-adjusted level
+ps.melt$Genus <- as.character(ps.melt$Genus)
+ps.melt <- ps.melt %>%
+  group_by(Pathology, Genus) %>%
+  mutate(median=median(Abundance))
+# select Pathology mean > 1
+keep <- unique(ps.melt$Genus[ps.melt$Abundance > 1])
+ps.melt$Genus[!(ps.melt$Genus %in% keep)] <- "Other"
+colourCount = length(unique(ps.melt$Genus))
+P36 = createPalette(colourCount,  c("#ff0000", "#00ff00", "#0000ff"))
+names(P36) <- NULL
+#to get the same rows together
+ps.melt_sum <- ps.melt %>%
+  group_by(Sample, Pathology,Genus) %>%
+  summarise(Abundance=sum(Abundance))
+pdf(file=sprintf("results/Genus_profile_Sample_type_ps_v6v9.pdf"), width=25)
+ggplot(ps.melt, aes(x = Pathology, y = Abundance, fill = Genus, color = Genus)) + 
+  geom_bar(stat = "identity", aes(fill=Genus), position="fill") + 
+  labs(x="Ethnicity", y="Relative abundance") +
+  theme_classic() + 
+  theme(legend.position = "right", 
+        strip.background = element_blank(), 
+        axis.text.x.bottom = element_text(angle = -90)) + theme(text = element_text(size=15)) + scale_y_continuous(labels = scales::percent) + scale_fill_manual(values = P36) + scale_color_manual(values = P36)  +  theme(legend.text = element_text(face = c(rep("italic", 5), rep("plain", 5)))) + facet_wrap(~Ethnicity)
+dev.off()
